@@ -1,0 +1,1004 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+\definecolor{BlueLink}{RGB}{20,80,160}
+\definecolor{CodeBg}{RGB}{247,247,250}
+\definecolor{CodeKw}{RGB}{140,20,120}
+\definecolor{CodeStr}{RGB}{20,110,60}
+\definecolor{CodeCom}{RGB}{110,110,120}
+
+\usepackage[colorlinks=true,linkcolor=BlueLink,citecolor=BlueLink,urlcolor=BlueLink]{hyperref}
+
+\lstdefinestyle{py}{
+  language=Python,
+  backgroundcolor=\color{CodeBg},
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{CodeKw}\bfseries,
+  stringstyle=\color{CodeStr},
+  commentstyle=\color{CodeCom}\itshape,
+  numbers=left, numberstyle=\tiny\color{CodeCom}, numbersep=7pt,
+  frame=single, framesep=4pt, rulecolor=\color{CodeBg!50!gray},
+  showstringspaces=false, breaklines=true, columns=fullflexible,
+  captionpos=b, xleftmargin=14pt,
+}
+\lstset{style=py}
+
+% a little extra give, so the unbreakable \shape{...} and \code{...} tokens
+% cannot push a line past the margin
+\emergencystretch=2.5em
+
+% shape macro: \shape{B,N,3}
+\newcommand{\shape}[1]{\ensuremath{[\,\texttt{#1}\,]}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\bh}{\mathbf{h}}
+\newcommand{\bz}{\mathbf{z}}
+\newcommand{\bm}{\boldsymbol{\epsilon}}
+\newcommand{\file}[1]{\textcolor{BlueLink}{\texttt{#1}}}
+
+\title{\textbf{Equivariant Diffusion for 3D Molecule Generation on QM9}\\[4pt]
+\large A line-by-line walkthrough of the implementation}
+\author{Code documentation}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This document explains an implementation of an $E(3)$-equivariant denoising
+diffusion probabilistic model that generates small organic molecules as 3D point
+clouds --- atom types \emph{and} Cartesian coordinates jointly --- trained on
+QM9. It is a compact reimplementation of EDM (Hoogeboom et al., 2022) with an
+EGNN (Satorras et al., 2021) denoiser, depending only on \code{torch} and
+\code{numpy}.
+
+The emphasis throughout is on \textbf{tensor shapes}: every array is annotated
+with its dimensions, and each transformation states what the shape was before
+and after. All shapes, parameter counts and schedule values quoted here were
+measured by instrumenting the running code, not derived on paper.
+\end{abstract}
+
+\tableofcontents
+
+\section{Notation and the dimension glossary}
+
+Six symbols determine every shape in the codebase. Fix them once and the rest
+of the document follows.
+
+\begin{center}
+\begin{tabular}{@{}clll@{}}
+\toprule
+\textbf{Symbol} & \textbf{Meaning} & \textbf{Code name} & \textbf{Typical value} \\
+\midrule
+$B$ & batch size (molecules per batch)   & \code{batch\_size} & $64$ \\
+$N$ & padded atom count (max in split)   & \code{max\_n}      & $29$ with H, $9$ without \\
+$K$ & number of atom types               & \code{num\_types}  & $5$ (H,C,N,O,F); $4$ without H \\
+$H$ & hidden width of the EGNN           & \code{hidden}      & $192$ \\
+$L$ & number of EGNN layers              & \code{n\_layers}   & $6$ \\
+$T$ & diffusion timesteps                & \code{timesteps}   & $1000$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+A molecule is represented \emph{densely}: every molecule in a batch is padded to
+$N$ atoms and carries a binary mask marking which slots are real.
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Tensor} & \textbf{Shape} & \textbf{Contents} \\
+\midrule
+\code{x}    & \shape{B,N,3} & atom coordinates in \r{A}ngstr\"om, zeros in padded slots \\
+\code{h}    & \shape{B,N,K} & one-hot atom types, all-zero rows in padded slots \\
+\code{mask} & \shape{B,N}   & $1.0$ for a real atom, $0.0$ for padding \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+The mask is the load-bearing part of the dense design. It appears in every
+sum, every mean and every layer output; a single missing multiplication by it
+lets padded slots contribute to a molecule's chemistry. Section~\ref{sec:masking}
+collects the places where this matters.
+
+\paragraph{Why $N$ differs between modes.} $N$ is not a constant of the model
+but of the \emph{data split}: \code{QM9Dataset} truncates its padded arrays to
+the largest molecule it actually contains. With hydrogens that is $29$; with
+\code{--remove-h} the heavy-atom skeletons top out around $9$. Since the cost of
+a forward pass grows as $N^2$ (Section~\ref{sec:cost}), this single number
+accounts for the $\sim\!6\times$ speed difference between the two modes.
+
+\section{The data pipeline: \file{qm9\_diffusion/data.py}}
+
+\subsection{From the raw release to a padded cache}
+
+QM9 is 133{,}885 small organic molecules over $\{$H, C, N, O, F$\}$, each with a
+DFT-relaxed geometry. The loader needs only types and coordinates, so it
+discards everything else and caches one \code{.npz}:
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Stage} & \textbf{Representation} & \textbf{Shape} & \textbf{dtype} \\
+\midrule
+raw            & \code{gdb9.sdf}, one text record per molecule & --- & text \\
+parsed         & Python list of per-molecule arrays  & $M\times(n_i,3)$ & \code{float32} \\
+cached         & \code{positions}   & \shape{133885,29,3} & \code{float32} \\
+               & \code{atom\_types} & \shape{133885,29}   & \code{int8} \\
+               & \code{num\_atoms}  & \shape{133885}      & \code{int16} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Molecule $i$ occupies rows $0\ldots n_i-1$ of its slice; rows $n_i\ldots 28$ are
+zero. The cache is $\approx 50$\,MB and is built once.
+
+\paragraph{The V2000 atom line.} \code{\_parse\_sdf} reads coordinates by fixed
+column offsets rather than by splitting on whitespace, because the MOL format is
+column-oriented and the fields can abut:
+\begin{lstlisting}[caption={Fixed-width parse of one SDF atom line \code{data.py}}]
+sym = line[31:34].strip()                       # element symbol
+pos[i] = (float(line[0:10]),                    # x, columns  1-10
+          float(line[10:20]),                   # y, columns 11-20
+          float(line[20:30]))                    # z, columns 21-30
+\end{lstlisting}
+That the resulting geometries reproduce the published stability statistics
+exactly (Section~\ref{sec:eval}) is the evidence that this parse is correct.
+
+\subsection{What one training example looks like}
+
+\code{QM9Dataset.\_\_getitem\_\_} converts stored integer types into the dense
+masked form the model consumes:
+
+\begin{lstlisting}[caption={\code{QM9Dataset.\_\_getitem\_\_} --- integer types to masked one-hot}]
+n = int(self.num_atoms[i])          # scalar: true atom count
+mask = torch.zeros(self.max_n)      # [N]
+mask[:n] = 1.0                      # [N],   n ones then zeros
+one_hot = F.one_hot(self.atom_types[i], self.num_types).float()   # [N] -> [N,K]
+return {
+    "x":    self.positions[i] * mask[:, None],   # [N,3] * [N,1] -> [N,3]
+    "h":    one_hot           * mask[:, None],   # [N,K] * [N,1] -> [N,K]
+    "mask": mask,                                # [N]
+}
+\end{lstlisting}
+
+\noindent
+Two shape details deserve attention:
+\begin{itemize}[leftmargin=1.4em]
+  \item \code{mask[:, None]} promotes \shape{N} to \shape{N,1} so it broadcasts
+        against both \shape{N,3} and \shape{N,K}. The same idiom recurs
+        throughout the model as \code{node\_mask.unsqueeze(-1)}.
+  \item The one-hot of a padded slot would be $e_0$ (type index $0$), i.e.\ a
+        spurious hydrogen. Multiplying by the mask replaces it with the all-zero
+        row, which is what makes padded atoms genuinely typeless.
+\end{itemize}
+
+\noindent
+The \code{DataLoader} then stacks $B$ such dictionaries, prepending the batch
+axis and producing exactly the \shape{B,N,3}, \shape{B,N,K}, \shape{B,N} triple
+of Section~1.
+
+\subsection{The size distribution $p(N_{\text{atoms}})$}
+
+At generation time the model must be told \emph{how many} atoms to generate --- the
+diffusion process itself does not create or destroy nodes. The empirical
+histogram supplies that:
+
+\begin{lstlisting}[caption={\code{size\_histogram} --- an empirical prior over molecule size}]
+hist = torch.bincount(self.num_atoms, minlength=self.max_n + 1).float()  # [N+1]
+return hist / hist.sum()                                                 # [N+1]
+\end{lstlisting}
+
+\noindent
+Index $k$ holds $p(n_{\text{atoms}}=k)$, hence length $N+1$ rather than $N$.
+Sampling proceeds by drawing sizes and turning them into a mask:
+\begin{lstlisting}
+sizes = torch.multinomial(size_hist, n_samples, replacement=True)   # [B]
+mask  = (torch.arange(max_n)[None, :] < sizes[:, None]).float()     # [1,N] vs [B,1] -> [B,N]
+\end{lstlisting}
+The comparison broadcasts a row vector of positions against a column vector of
+lengths, yielding a left-aligned boolean mask in one operation.
+
+\section{The zero-centre-of-mass subspace}
+\label{sec:com}
+
+This is the one piece of geometry that must be understood before the model makes
+sense, so it comes before the network.
+
+\paragraph{The problem.} We want the learned density $p(\bx)$ over
+$\bx\in\R^{n\times 3}$ to be invariant to rigid motions: a molecule and its
+translated copy are the same molecule. But no probability density on $\R^{n\times 3}$
+can be translation invariant. If $p(\bx)=p(\bx+t\mathbf{1})$ for every
+$t\in\R^3$, then $p$ is constant along $3$ unbounded directions and cannot
+integrate to $1$.
+
+\paragraph{The fix.} Quotient out the offending directions. Work on the linear
+subspace of configurations whose centre of mass is the origin,
+\begin{equation}
+  \mathcal{X}_0 \;=\; \Bigl\{\, \bx \in \R^{n\times3} \;:\; \textstyle\sum_{i=1}^{n} \bx_i = \mathbf{0} \,\Bigr\},
+  \qquad \dim \mathcal{X}_0 \;=\; 3(n-1).
+\end{equation}
+A density on $\mathcal{X}_0$ \emph{is} normalisable, and pushing it forward by
+"place the centre of mass anywhere" gives the translation-invariant object we
+actually want. Every coordinate quantity in the code therefore lives in
+$\mathcal{X}_0$: the data, the noise, and the network's coordinate output.
+
+\paragraph{The projection.} It is a mean subtraction, but a \emph{masked} one:
+the mean must be taken over the $n_b$ real atoms of molecule $b$, not over all
+$N$ padded slots.
+
+\begin{lstlisting}[caption={\code{remove\_mean} --- projection onto $\mathcal{X}_0$ \code{diffusion.py}}]
+def remove_mean(x, node_mask):                       # x [B,N,3], node_mask [B,N]
+    nm   = node_mask.unsqueeze(-1)                   # [B,N]   -> [B,N,1]
+    n    = node_mask.sum(1).view(-1, 1, 1).clamp(min=1.0)   # [B,N] -> [B] -> [B,1,1]
+    mean = (x * nm).sum(1, keepdim=True) / n          # [B,N,3] -> [B,1,3]
+    return (x - mean) * nm                            # [B,1,3] broadcasts -> [B,N,3]
+\end{lstlisting}
+
+\noindent
+Shape trace: \shape{B,N,3} $\to$ sum over the atom axis $\to$ \shape{B,1,3}
+$\to$ broadcast back to \shape{B,N,3}. The \code{keepdim=True} is what makes the
+subtraction broadcast without an explicit \code{unsqueeze}. The
+\code{clamp(min=1.0)} guards against a division by zero for an all-padding row.
+
+\paragraph{Noise must be projected too.} Gaussian noise added to a point in
+$\mathcal{X}_0$ has to stay in $\mathcal{X}_0$, so the sampler never uses raw
+\code{randn} for coordinates:
+\begin{lstlisting}
+def sample_zero_com_noise(shape, node_mask, device):
+    return remove_mean(torch.randn(shape, device=device), node_mask)   # [B,N,3]
+\end{lstlisting}
+This projected noise is \emph{not} standard normal: it has variance
+$\tfrac{n-1}{n}$ per coordinate, a fact used to check the sampler in
+Section~\ref{sec:calib}.
+
+\section{The denoiser: \file{qm9\_diffusion/egnn.py}}
+\label{sec:egnn}
+
+The network's job is a regression: given a noisy molecule and a timestep,
+predict the noise that was added. It returns two tensors,
+$\hat{\bm}_x$ \shape{B,N,3} and $\hat{\bm}_h$ \shape{B,N,K}.
+
+\subsection{Why an EGNN and not an MLP}
+
+Rotating a molecule rotates the noise that was added to it. A generic network
+would have to learn this from data, spending capacity on a symmetry we already
+know. An EGNN builds it in. Writing $R$ for a rotation/reflection in $O(3)$, the
+network satisfies
+\begin{equation}
+  \hat{\bm}_x(\bx R,\,\bh,\,t) \;=\; \hat{\bm}_x(\bx,\,\bh,\,t)\,R,
+  \qquad
+  \hat{\bm}_h(\bx R,\,\bh,\,t) \;=\; \hat{\bm}_h(\bx,\,\bh,\,t),
+\end{equation}
+i.e.\ the coordinate output is \emph{equivariant} and the type output is
+\emph{invariant}. The two structural facts that produce this:
+\begin{enumerate}[leftmargin=1.6em]
+  \item messages are functions of squared interatomic distances
+        $\lVert \bx_i-\bx_j\rVert^2$, which are $O(3)$-invariant;
+  \item coordinates are updated only along relative-position vectors
+        $\bx_i-\bx_j$, which are $O(3)$-equivariant.
+\end{enumerate}
+Scalars times equivariant vectors stay equivariant, and the composition of
+equivariant layers is equivariant, so the property holds for the whole stack.
+\code{test\_smoke.py} verifies it numerically to $5\times10^{-7}$.
+
+\subsection{Input embedding: where the timestep enters}
+
+\begin{lstlisting}[caption={\code{EGNNDynamics.forward} --- masks and embedding}]
+b, n, _ = x.shape                                  # B, N
+nm  = node_mask.unsqueeze(-1)                      # [B,N] -> [B,N,1]
+eye = torch.eye(n).view(1, n, n, 1)                # [N,N] -> [1,N,N,1]
+edge_mask = (nm.unsqueeze(2) * nm.unsqueeze(1)) * (1.0 - eye)   # -> [B,N,N,1]
+
+t_node = t.view(b, 1, 1).expand(-1, n, 1)          # [B] -> [B,1,1] -> [B,N,1]
+hidden = self.embed(torch.cat([h, t_node], -1)) * nm   # [B,N,K+1] -> [B,N,H]
+\end{lstlisting}
+
+\noindent
+Three shape manipulations, each worth naming:
+
+\begin{center}\small
+\begin{tabular}{@{}lccp{5.1cm}@{}}
+\toprule
+\textbf{Expression} & \textbf{Before} & \textbf{After} & \textbf{Purpose} \\
+\midrule
+\code{nm.unsqueeze(2)}\newline\code{\ \ \ \ * nm.unsqueeze(1)} & \shape{B,N,1} & \shape{B,N,N,1} & outer product of the masks: edge $(i,j)$ is live iff both ends are real \\
+\addlinespace
+\code{* (1.0 - eye)} & \shape{B,N,N,1} & \shape{B,N,N,1} & delete the self-loops \\
+\addlinespace
+\code{t.view(b,1,1)}\newline\code{\ \ \ \ .expand(-1,n,1)} & \shape{B} & \shape{B,N,1} & broadcast the scalar time to every node \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+The time conditioning is deliberately minimal: $t$ is a single scalar in $[0,1]$
+concatenated as one extra input channel, so the embedding is a linear map
+$\R^{K+1}\!\to\!\R^{H}$ ($6\to192$ by default, only $1{,}344$ parameters). There
+is no sinusoidal Fourier embedding here --- a design simplification relative to
+image diffusion models, where the timestep is usually embedded richly.
+
+\code{expand} rather than \code{repeat} is used because it creates a
+\emph{view} with stride $0$ along the atom axis; no $B\times N$ block of memory
+is written for what is logically one number per molecule.
+
+\subsection{One EGNN layer, shape by shape}
+
+This is the core of the model. The layer maps
+$(\bh,\bx)\in$\shape{B,N,H}$\times$\shape{B,N,3} to a tensor pair of the same
+two shapes, but the intermediate quantities live on \emph{edges} and carry a
+fourth axis. With $B=64$, $N=29$, $H=192$ the trace is:
+
+\begin{center}
+\begin{longtable}{@{}llll@{}}
+\toprule
+\textbf{Line} & \textbf{Quantity} & \textbf{Shape} & \textbf{Concrete} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Line} & \textbf{Quantity} & \textbf{Shape} & \textbf{Concrete} \\
+\midrule
+\endhead
+in  & \code{h}                & \shape{B,N,H}    & $(64,29,192)$ \\
+in  & \code{x}                & \shape{B,N,3}    & $(64,29,3)$ \\
+\addlinespace
+1   & \code{diff}             & \shape{B,N,N,3}  & $(64,29,29,3)$ \\
+2   & \code{d2}               & \shape{B,N,N,1}  & $(64,29,29,1)$ \\
+3   & \code{norm}             & \shape{B,N,N,1}  & $(64,29,29,1)$ \\
+\addlinespace
+4   & \code{hi} (expand)      & \shape{B,N,N,H}  & $(64,29,29,192)$ \\
+5   & \code{hj} (expand)      & \shape{B,N,N,H}  & $(64,29,29,192)$ \\
+6   & \code{edge\_mlp} input  & \shape{B,N,N,2H{+}1} & $(64,29,29,385)$ \\
+7   & \code{m} (message)      & \shape{B,N,N,H}  & $(64,29,29,192)$ \\
+8   & \code{att} (gate)       & \shape{B,N,N,1}  & $(64,29,29,1)$ \\
+9   & \code{m*att*edge\_mask} & \shape{B,N,N,H}  & $(64,29,29,192)$ \\
+\addlinespace
+10  & \code{coord\_mlp(m)}    & \shape{B,N,N,1}  & $(64,29,29,1)$ \\
+11  & \code{trans}            & \shape{B,N,N,3}  & $(64,29,29,3)$ \\
+12  & \code{n\_edges}         & \shape{B,N,1}    & $(64,29,1)$ \\
+13  & \code{agg}              & \shape{B,N,H}    & $(64,29,192)$ \\
+14  & \code{node\_mlp} input  & \shape{B,N,2H}   & $(64,29,384)$ \\
+\addlinespace
+out & \code{h}                & \shape{B,N,H}    & $(64,29,192)$ \\
+out & \code{x}                & \shape{B,N,3}    & $(64,29,3)$ \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\noindent
+The pattern is a round trip: \textbf{node axis $\to$ edge axis $\to$ node axis}.
+Lines 1--9 lift \shape{B,N,$\cdot$} to \shape{B,N,N,$\cdot$}; lines 11--13
+contract the third axis away with a sum. The code:
+
+\begin{lstlisting}[caption={\code{EquivariantConv.forward}}]
+diff = x.unsqueeze(2) - x.unsqueeze(1)     # [B,N,1,3] - [B,1,N,3] -> [B,N,N,3]
+d2   = (diff**2).sum(-1, keepdim=True)     #                       -> [B,N,N,1]
+norm = (d2 + 1e-8).sqrt()                  #                       -> [B,N,N,1]
+
+hi = h.unsqueeze(2).expand(-1, -1, n, -1)  # [B,N,1,H] -> [B,N,N,H]   (sender)
+hj = h.unsqueeze(1).expand(-1, n, -1, -1)  # [B,1,N,H] -> [B,N,N,H]   (receiver)
+m  = self.edge_mlp(torch.cat([hi, hj, d2], dim=-1))   # [B,N,N,2H+1] -> [B,N,N,H]
+m  = m * self.att_mlp(m) * edge_mask       # [B,N,N,H] * [B,N,N,1] * [B,N,N,1]
+
+trans   = diff / (norm + 1.0) * torch.tanh(self.coord_mlp(m)) * self.coords_range
+trans   = trans * edge_mask                          # [B,N,N,3]
+n_edges = edge_mask.sum(dim=2).clamp(min=1.0)        # [B,N,N,1] -> [B,N,1]
+x = x + (trans.sum(dim=2) / n_edges) * node_mask     # [B,N,N,3] -> [B,N,3]
+
+agg = m.sum(dim=2) / n_edges                         # [B,N,N,H] -> [B,N,H]
+h   = h + self.node_mlp(torch.cat([h, agg], dim=-1)) # [B,N,2H] -> [B,N,H]
+return h * node_mask, x * node_mask
+\end{lstlisting}
+
+\paragraph{The broadcast that builds the edge axis.} \code{x.unsqueeze(2)} is
+\shape{B,N,1,3} and \code{x.unsqueeze(1)} is \shape{B,1,N,3}; subtracting them
+broadcasts both to \shape{B,N,N,3}, and entry $(b,i,j)$ of the result holds
+$\bx_i-\bx_j$. This one line materialises all $N^2$ ordered pairs. The same
+asymmetry names the two expanded copies of \code{h}: \code{hi} varies along
+axis~1 and \code{hj} along axis~2, so the concatenation at position $(i,j)$ is
+$[\bh_i,\bh_j,d^2_{ij}]$.
+
+\paragraph{The equations.} In standard EGNN notation, with $\phi_e,\phi_h,\phi_x$
+the three MLPs and $\phi_a$ the gate:
+\begin{align}
+  \mathbf{m}_{ij} &= \phi_a\!\bigl(\tilde{\mathbf{m}}_{ij}\bigr)\,\tilde{\mathbf{m}}_{ij}\,,
+    \qquad \tilde{\mathbf{m}}_{ij} = \phi_e\bigl(\bh_i,\bh_j,\lVert\bx_i-\bx_j\rVert^2\bigr), \\
+  \bx_i' &= \bx_i + \frac{1}{|\mathcal{N}_i|}\sum_{j\neq i}
+            \frac{\bx_i-\bx_j}{\lVert\bx_i-\bx_j\rVert+1}\;
+            \gamma\tanh\!\bigl(\phi_x(\mathbf{m}_{ij})\bigr), \\
+  \bh_i' &= \bh_i + \phi_h\Bigl(\bh_i,\;\tfrac{1}{|\mathcal{N}_i|}\textstyle\sum_{j\neq i}\mathbf{m}_{ij}\Bigr).
+\end{align}
+
+\paragraph{Design choices inside the layer.}
+\begin{description}[leftmargin=0pt,style=nextline]
+\item[The $+1$ in the denominator.] \code{diff / (norm + 1.0)} is not a unit
+      vector. Dividing by $\lVert\bx_i-\bx_j\rVert$ alone would make the update
+      blow up for nearby atoms; the offset bounds the factor while keeping
+      direction, and it is still equivariant because it scales an equivariant
+      vector by an invariant scalar.
+\item[$\gamma\tanh(\cdot)$.] \code{coords\_range} is passed as
+      $\gamma=15/L=2.5$\,\r{A}, so a single layer can displace an atom by at most
+      $2.5$\,\r{A} and the whole stack by at most $15$\,\r{A}. Without this bound
+      the geometry can diverge early in training, and because distances feed
+      back into the next layer's messages, a diverged geometry produces garbage
+      messages rather than merely a large loss.
+\item[Small initialisation of the coordinate head.]
+      \code{xavier\_uniform\_(..., gain=0.001)} makes each layer start as
+      approximately the identity on coordinates, so the model begins near
+      "predict no displacement" and learns geometry gradually.
+\item[Mean rather than sum aggregation.] Dividing by \code{n\_edges} keeps
+      activation magnitudes independent of molecule size. Because
+      \code{n\_edges} is computed from \code{edge\_mask}, the denominator is the
+      true neighbour count $n_b-1$, not $N-1$: a $5$-atom molecule in a batch
+      padded to $29$ is normalised by $4$.
+\item[The gate.] \code{att\_mlp} is a $\text{Linear}(H,1)+\sigma$ producing one
+      scalar in $(0,1)$ per edge. All $N^2$ pairs are present in a dense graph,
+      most of them non-bonded; the gate lets the network suppress them instead of
+      being forced to attend to everything.
+\end{description}
+
+\paragraph{A pitfall that this code hit.} Line 3 reads
+\code{(d2 + 1e-8).sqrt()} rather than \code{d2.sqrt()}. Self-pairs ($i=j$) and
+padding-padding pairs both have \code{diff}$=0$, hence \code{d2}$=0$, and
+$\frac{d}{du}\sqrt{u}\to\infty$ as $u\to0$. The forward pass looks fine --- those
+entries are killed by \code{edge\_mask} --- but the backward pass computes
+$\infty \times 0 = \text{NaN}$ and the loss becomes NaN on the first step.
+Masking an output does not protect its gradient; the guard has to be inside the
+square root.
+
+\subsection{Output heads}
+
+\begin{lstlisting}[caption={From the last layer to $(\hat{\bm}_x,\hat{\bm}_h)$}]
+eps_x = (x - x0) * nm                                       # [B,N,3]
+eps_x = eps_x - eps_x.sum(1, keepdim=True) / node_mask.sum(1).view(b,1,1)
+eps_x = eps_x * nm                                          # [B,N,3], zero-CoM
+eps_h = self.decode(hidden) * nm                            # [B,N,H] -> [B,N,K]
+\end{lstlisting}
+
+\noindent
+Two things happen here.
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{The coordinate prediction is a displacement}, $\bx^{(L)}-\bx^{(0)}$,
+      not the final coordinates. This is what makes the output transform
+      correctly: both terms rotate together, so their difference does, whereas an
+      absolute position would also have to track the input's placement.
+\item \textbf{It is re-projected onto $\mathcal{X}_0$.} The target noise lives in
+      the subspace, so the prediction must too --- otherwise the model wastes
+      capacity on a component that can never reduce the loss, and the sampler
+      accumulates centre-of-mass drift over $T$ steps. Verified to
+      $1.5\times10^{-11}$ in the tests.
+\end{enumerate}
+
+\noindent
+Note $\hat{\bm}_h$ is a free real-valued tensor in $\R^{B\times N\times K}$, not
+a probability vector: there is no softmax. It predicts Gaussian noise on the
+relaxed one-hot representation, which is why the loss below is a plain MSE.
+
+\subsection{Parameter budget}
+
+Measured for $H=192$, $L=6$, $K=5$:
+
+\begin{center}
+\begin{tabular}{@{}llrr@{}}
+\toprule
+\textbf{Module} & \textbf{Shape of the map} & \textbf{Params} & \textbf{$\times L$} \\
+\midrule
+\code{embed}     & $K{+}1 \to H$ \; $(6\to192)$              & $1{,}344$   & --- \\
+\code{edge\_mlp} & $2H{+}1 \to H \to H$ \; $(385\to192\to192)$ & $111{,}168$ & $667{,}008$ \\
+\code{att\_mlp}  & $H \to 1$                                  & $193$       & $1{,}158$ \\
+\code{node\_mlp} & $2H \to H \to H$ \; $(384\to192\to192)$     & $110{,}976$ & $665{,}856$ \\
+\code{coord\_mlp}& $H \to H \to 1$ \; $(192\to192\to1)$        & $37{,}249$  & $223{,}494$ \\
+\code{decode}    & $H \to H \to K$ \; $(192\to192\to5)$        & $38{,}021$  & --- \\
+\midrule
+\textbf{Total}   &                                            & \multicolumn{2}{r}{$\mathbf{1{,}596{,}881}$} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+$97.5\%$ of the parameters sit in the $L$ repeated layers, split almost evenly
+between \code{edge\_mlp} and \code{node\_mlp}. The diffusion wrapper adds no
+parameters --- its schedules are registered as \emph{buffers}, so they move with
+\code{.to(device)} and are saved in checkpoints but are not optimised.
+
+\section{The diffusion model: \file{qm9\_diffusion/diffusion.py}}
+
+\subsection{The forward (noising) process}
+
+Write $\bz_0=[\bx,\bh]$ for a clean molecule. The forward process is the usual
+variance-preserving Gaussian diffusion,
+\begin{equation}
+  q(\bz_t \mid \bz_0) \;=\; \mathcal{N}\bigl(\bz_t;\;\alpha_t \bz_0,\;\sigma_t^2 \mathbf{I}\bigr),
+  \qquad\text{implemented as}\qquad
+  \bz_t \;=\; \alpha_t \bz_0 + \sigma_t \bm,\quad \bm\sim\mathcal{N}(0,\mathbf{I}),
+\end{equation}
+with $\alpha_t^2+\sigma_t^2=1$, so $\alpha_t$ decays from $\approx1$ to
+$\approx0$ as $t: 0\to T$. Coordinates and types are noised jointly with the
+\emph{same} $(\alpha_t,\sigma_t)$, but the coordinate noise is drawn in
+$\mathcal{X}_0$ and the type noise in the full $\R^{K}$.
+
+\subsection{The noise schedule}
+
+\code{polynomial\_schedule} returns the array $\bar\alpha_t=\alpha_t^2$ for
+$t=0,\dots,T$ --- length $T+1$, i.e.\ $1001$ entries for $T=1000$:
+\begin{equation}
+  \bar\alpha_t \;=\; (1-2s)\cdot\text{clip}\Bigl[\bigl(1-(t/T')^{2}\bigr)^{2}\Bigr] + s,
+  \qquad s=10^{-5},\; T'=T+1 .
+\end{equation}
+\code{\_clip\_noise\_schedule} bounds the per-step ratio
+$\bar\alpha_t/\bar\alpha_{t-1}\ge 0.001$ so that no single step annihilates the
+signal, then re-accumulates with \code{cumprod}. The affine map by $s$ keeps
+$\bar\alpha$ strictly inside $(0,1)$: at $t=0$ a tiny amount of noise remains
+(which is why sampling ends with an explicit denoise at $t=0$ rather than just
+reading off $\bz_0$), and at $t=T$ a tiny amount of signal remains, keeping
+$\alpha_T>0$ so the division in the sampler is safe.
+
+Measured values, with the signal-to-noise ratio $\text{SNR}=\alpha_t^2/\sigma_t^2$:
+
+\begin{center}
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+$t$ & $\alpha_t$ & $\sigma_t$ & SNR \\
+\midrule
+$0$    & $0.999995$ & $0.003162$ & $1.0\times10^{5}$ \\
+$100$  & $0.989995$ & $0.141101$ & $49.2$ \\
+$500$  & $0.749999$ & $0.661439$ & $1.29$ \\
+$900$  & $0.190024$ & $0.981779$ & $0.0375$ \\
+$1000$ & $0.003163$ & $0.999995$ & $1.0\times10^{-5}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Scaling of the two modalities}
+
+\begin{lstlisting}
+def normalize(self, x, h):   return x, h * self.h_scale     # h_scale = 0.25
+def unnormalize(self, x, h): return x, h / self.h_scale
+\end{lstlisting}
+
+\noindent
+Shapes are untouched; only the magnitude of \code{h} changes. Coordinates have a
+per-component standard deviation of about $1.4$\,\r{A} in QM9, whereas a one-hot
+entry is exactly $0$ or $1$ --- and it is a \emph{discontinuous} target. Left
+unscaled, the type channels dominate the gradient and the model under-fits
+geometry. Multiplying by $0.25$ puts the two modalities on comparable footing.
+Because the argmax used at decoding time is invariant to a positive rescaling,
+this choice affects only the loss balance, never the decoded label.
+
+\subsection{The training loss}
+
+\begin{lstlisting}[caption={\code{EquivariantDiffusion.loss}}]
+b = x.shape[0]
+x, h = self.normalize(x, h)                     # [B,N,3], [B,N,K]
+x    = remove_mean(x, node_mask)                # project data into X_0
+
+t_int = torch.randint(0, self.timesteps + 1, (b,))      # [B]  integers in {0..T}
+alpha = self.alphas[t_int].view(b, 1, 1)        # [B] -> [B,1,1]
+sigma = self.sigmas[t_int].view(b, 1, 1)        # [B] -> [B,1,1]
+
+eps_x = sample_zero_com_noise(x.shape, node_mask, x.device)   # [B,N,3] in X_0
+eps_h = torch.randn_like(h) * node_mask.unsqueeze(-1)          # [B,N,K]
+
+z_x = alpha * x + sigma * eps_x                 # [B,1,1]*[B,N,3] -> [B,N,3]
+z_h = alpha * h + sigma * eps_h                 # [B,1,1]*[B,N,K] -> [B,N,K]
+
+pred_x, pred_h = self.dynamics(t_int.float() / self.timesteps, z_x, z_h, node_mask)
+
+err  = ((pred_x - eps_x)**2).sum() + ((pred_h - eps_h)**2).sum()   # -> scalar
+n_atoms = node_mask.sum()                                          # -> scalar
+dof  = 3 * (n_atoms - b) + self.num_types * n_atoms                # -> scalar
+return err / dof
+\end{lstlisting}
+
+\noindent
+Shape observations:
+\begin{itemize}[leftmargin=1.4em]
+\item \code{alphas} is indexed by a \shape{B} integer tensor, giving a \shape{B}
+      result, reshaped to \shape{B,1,1} so it broadcasts over both the atom and
+      feature axes. Each molecule in the batch gets its \emph{own} timestep ---
+      this is what makes one pass over the data cover the whole of $[0,T]$.
+\item \code{t\_int.float() / self.timesteps} converts integer timesteps to the $[0,1]$
+      scalars the network expects, shape \shape{B}.
+\item Both squared errors reduce to a scalar over \emph{all} axes at once. Padded
+      slots contribute exactly $0$: \code{pred} is masked by the network and
+      \code{eps} is masked at construction.
+\end{itemize}
+
+\paragraph{The normalising constant.} The loss is the eps-prediction objective
+with weight $w(t)=1$,
+\begin{equation}
+  \mathcal{L} \;=\;
+  \frac{\sum_b \bigl\lVert \hat{\bm}_x^{(b)} - \bm_x^{(b)} \bigr\rVert^2
+      + \bigl\lVert \hat{\bm}_h^{(b)} - \bm_h^{(b)} \bigr\rVert^2}
+       {\underbrace{3\bigl(\textstyle\sum_b n_b - B\bigr)}_{\text{coordinate d.o.f.}}
+      + \underbrace{K\textstyle\sum_b n_b}_{\text{type d.o.f.}}}\,.
+\end{equation}
+The $-B$ is the geometry of Section~\ref{sec:com} showing up in the arithmetic:
+each molecule contributes $3(n_b-1)$ coordinate degrees of freedom, not $3n_b$,
+because the centre-of-mass constraint removes three. Dividing by the true
+dimension makes the reported number a per-dimension mean, comparable across
+batches with different molecule sizes --- and hence comparable between the
+training and validation logs.
+
+\paragraph{What is omitted.} This is EDM's $L_{\text{simple}}$ only. There is no
+variational bound / negative log-likelihood term, no $L_0$ reconstruction term,
+and no $t$-dependent reweighting. That is the standard practical choice --- the
+paper reports that $w(t)=1$ trains better samples than the true ELBO weighting ---
+but it means this code cannot report likelihoods.
+
+\section{Training: \file{train.py}}
+
+\subsection{The loop}
+
+\begin{lstlisting}[caption={The inner training step}]
+for batch in train_loader:
+    x, h, mask = (batch[k].to(device) for k in ("x", "h", "mask"))  # [B,N,3] [B,N,K] [B,N]
+    loss = model.loss(x, h, mask)                                   # scalar
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+    opt.step()
+    ema.update(model)
+\end{lstlisting}
+
+\noindent
+Four details carry weight here.
+
+\begin{description}[leftmargin=0pt,style=nextline]
+\item[Gradient clipping is not optional.] The observed gradient norm on the first
+      iteration is $\approx 530$, falling to $\approx 100$ within one epoch.
+      Clipping at $1.5$ is what keeps the early updates from destroying the
+      coordinate head. The norm is logged so this can be watched.
+\item[AdamW with \code{amsgrad}, $\text{lr}=10^{-4}$, weight decay $10^{-12}$.]
+      The decay is effectively off; it is present because EDM uses this exact
+      configuration, and diffusion training is known to be sensitive to
+      regularisation that fights the noise-prediction objective.
+\item[EMA of the weights.] Diffusion sampling chains $T$ forward passes, so
+      small weight noise compounds. \code{EMA} keeps a shadow copy updated as
+      $\theta_{\text{ema}} \leftarrow 0.999\,\theta_{\text{ema}} + 0.001\,\theta$
+      after every step, and it is the shadow that is sampled from. Its horizon
+      is $\sim\!1000$ steps, under one epoch at $1562$ iterations/epoch.
+\item[The shadow is a whole diffusion model.] \code{EMA} deep-copies the
+      \code{EquivariantDiffusion} object, so \code{ema.shadow.sample(...)} works
+      directly. The averaging loop iterates over \code{state\_dict()} values and
+      skips non-floating-point entries, so integer buffers are copied rather
+      than blended.
+\end{description}
+
+\subsection{Per-epoch evaluation}
+
+Each epoch records train loss, validation loss and wall time; every
+\code{--eval-every} epochs it additionally \emph{generates} molecules and scores
+them. The size-to-mask conversion is the interesting shape step:
+
+\begin{lstlisting}[caption={\code{sample\_and\_score}}]
+sizes = torch.multinomial(size_hist, n_samples, replacement=True)      # [B]
+mask  = (torch.arange(max_n)[None, :] < sizes[:, None]).float()        # [B,N]
+x, one_hot, _ = model.sample(mask)                                     # [B,N,3], [B,N,K]
+mols = to_molecules(x, one_hot, mask, symbols)      # dense -> list of (n_i,3) + symbols
+return evaluate(mols, implicit_h), mols
+\end{lstlisting}
+
+\noindent
+\code{to\_molecules} performs the inverse of the dataset's padding: it argmaxes
+the one-hot back to indices \shape{B,N}, converts the mask to a boolean, and uses
+it to slice each molecule down to its true length, yielding a ragged Python list
+of $(n_i,3)$ arrays with matching element symbols. Checkpoints store both raw and
+EMA weights, the config, and \code{size\_hist}, so \code{sample.py} can
+reconstruct the model without being told the architecture.
+
+\section{Sampling: \code{EquivariantDiffusion.sample}}
+\label{sec:sampling}
+
+\subsection{The reverse process}
+
+Sampling runs the chain backwards from pure noise. The generative model is
+factorised as $p(\bz_0) = p(\bz_T)\prod_{t=1}^{T} p(\bz_{t-1}\mid\bz_t)$, and
+each reverse step is obtained by taking the true posterior
+$q(\bz_s\mid\bz_t,\bz_0)$ for $s=t-1$ and substituting the network's estimate of
+$\bz_0$. Define
+\begin{equation}
+  \alpha_{t|s} = \frac{\alpha_t}{\alpha_s},
+  \qquad
+  \sigma^2_{t|s} = \sigma_t^2 - \alpha_{t|s}^2\,\sigma_s^2 .
+\end{equation}
+The Gaussian posterior is
+\begin{equation}
+  q(\bz_s\mid \bz_t,\bz_0)
+  = \mathcal{N}\!\Bigl(
+      \tfrac{\alpha_{t|s}\sigma_s^2}{\sigma_t^2}\,\bz_t
+      + \tfrac{\alpha_s \sigma^2_{t|s}}{\sigma_t^2}\,\bz_0,
+      \;\;
+      \tfrac{\sigma^2_{t|s}\,\sigma_s^2}{\sigma_t^2}\,\mathbf{I}
+    \Bigr).
+\end{equation}
+Substituting $\bz_0=(\bz_t-\sigma_t\bm)/\alpha_t$ and collecting the $\bz_t$
+terms,
+\begin{equation}
+  \alpha_{t|s}\sigma_s^2 + \frac{\sigma^2_{t|s}}{\alpha_{t|s}}
+  = \frac{\alpha_{t|s}^2\sigma_s^2 + \sigma_t^2 - \alpha_{t|s}^2\sigma_s^2}{\alpha_{t|s}}
+  = \frac{\sigma_t^2}{\alpha_{t|s}},
+\end{equation}
+so the mean collapses to a two-term expression in $\bz_t$ and the predicted
+noise, which is exactly what the code computes:
+\begin{equation}
+  \boxed{\;
+  \boldsymbol{\mu}_{t\to s} \;=\; \frac{\bz_t}{\alpha_{t|s}}
+    \;-\; \frac{\sigma^2_{t|s}}{\alpha_{t|s}\,\sigma_t}\,\hat{\bm}\,,
+  \qquad
+  \text{std} \;=\; \frac{\sigma_{t|s}\,\sigma_s}{\sigma_t}\;}
+\end{equation}
+
+\begin{lstlisting}[caption={\code{\_p\_step} --- one ancestral step $\bz_t\to\bz_{t-1}$}]
+s_int = t_int - 1
+a_t, s_t = self.alphas[t_int], self.sigmas[t_int]     # 0-dim tensors (scalars)
+a_s, s_s = self.alphas[s_int], self.sigmas[s_int]
+
+a_ts   = a_t / a_s
+var_ts = (s_t**2 - a_ts**2 * s_s**2).clamp(min=1e-12)
+std    = (var_ts.sqrt() * s_s / s_t).view(1, 1, 1)    # -> [1,1,1], broadcasts
+
+t = torch.full((b,), t_int / self.timesteps)                  # [B]
+pred_x, pred_h = self.dynamics(t, z_x, z_h, node_mask)   # [B,N,3], [B,N,K]
+
+coef = (var_ts / (a_ts * s_t)).view(1, 1, 1)          # [1,1,1]
+mu_x = z_x / a_ts - coef * pred_x                     # [B,N,3]
+mu_h = z_h / a_ts - coef * pred_h                     # [B,N,K]
+
+z_x = mu_x + std * sample_zero_com_noise(z_x.shape, node_mask, z_x.device)
+z_h = mu_h + std * torch.randn_like(z_h) * node_mask.unsqueeze(-1)
+return remove_mean(z_x, node_mask), z_h * node_mask.unsqueeze(-1)
+\end{lstlisting}
+
+\noindent
+Unlike training, sampling uses \emph{one} timestep for the whole batch, so
+$\alpha,\sigma$ are $0$-dimensional tensors reshaped to \shape{1,1,1} rather
+than \shape{B,1,1}. The coordinate noise is again drawn in $\mathcal{X}_0$, and
+\code{remove\_mean} is reapplied at the end of every step so floating-point
+drift cannot accumulate over $1000$ iterations.
+
+\subsection{The chain and the final decode}
+
+\begin{lstlisting}[caption={\code{sample} --- the full reverse trajectory}]
+z_x = sample_zero_com_noise((b, n, 3), node_mask, device)          # [B,N,3]
+z_h = torch.randn(b, n, self.num_types, device=device) * nm        # [B,N,K]
+
+for t_int in range(self.timesteps, 0, -1):                                 # T .. 1
+    z_x, z_h = self._p_step(z_x, z_h, t_int, node_mask)
+
+t = torch.zeros(b, device=device)                                  # [B]
+pred_x, pred_h = self.dynamics(t, z_x, z_h, node_mask)
+a0, s0 = self.alphas[0], self.sigmas[0]
+x = remove_mean((z_x - s0 * pred_x) / a0, node_mask)               # [B,N,3]
+h = (z_h - s0 * pred_h) / a0                                       # [B,N,K]
+
+x, h    = self.unnormalize(x, h)                                   # h /= 0.25
+types   = h.argmax(-1)                                             # [B,N,K] -> [B,N]
+one_hot = F.one_hot(types, self.num_types).float() * nm             # [B,N] -> [B,N,K]
+return x * nm, one_hot, frames
+\end{lstlisting}
+
+\noindent
+The loop runs $T$ times and each iteration is one full network forward pass ---
+sampling costs $1000\times$ a training forward pass, which is why generating a
+few hundred molecules takes longer than an epoch of training on them.
+
+Two steps close the process:
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{A final denoise at $t=0$.} Because $\sigma_0=0.0032\neq0$, $\bz_0$
+      is still very slightly noisy; $\bx = (\bz_x - \sigma_0\hat{\bm}_x)/\alpha_0$
+      removes that last increment.
+\item \textbf{Discretisation of the atom types.} \code{argmax} over the last axis
+      collapses \shape{B,N,K} to \shape{B,N} integer labels, which are re-expanded
+      to a clean one-hot. This is the point at which the continuous relaxation
+      becomes a discrete chemical decision --- and where information is
+      irrecoverably thrown away, since a near-tie between carbon and nitrogen is
+      resolved silently.
+\end{enumerate}
+
+\subsection{A closed-form check of the sampler}
+\label{sec:calib}
+
+The reverse-process algebra above can be validated without any trained network.
+If the data were $\bx\sim\mathcal{N}(0,\mathbf{I})$, then since
+$\bz_t\sim\mathcal{N}(0,(\alpha_t^2+\sigma_t^2)\mathbf{I})=\mathcal{N}(0,\mathbf{I})$,
+the optimal denoiser is available in closed form:
+\begin{equation}
+  \E[\bm \mid \bz_t] \;=\; \sigma_t\,\bz_t .
+\end{equation}
+Substituting this exact denoiser for the network must return samples with unit
+variance --- any error in $\alpha_{t|s}$, $\sigma^2_{t|s}$ or the standard
+deviation shows up as a drift in scale. The test in \code{test\_smoke.py} does
+precisely this with $n=6$ atoms and recovers a standard deviation of
+$\mathbf{0.911}$ against the analytic prediction for the projected subspace,
+\begin{equation}
+  \sqrt{\tfrac{n-1}{n}} \;=\; \sqrt{5/6} \;=\; 0.913 .
+\end{equation}
+The agreement, including the subspace correction, is the evidence that the
+schedule and the ancestral step are implemented correctly.
+
+\section{Evaluation: \file{qm9\_diffusion/stability.py}}
+\label{sec:eval}
+
+The model outputs coordinates, not bonds, so the metric has to infer chemistry
+from geometry. For each unordered pair, the interatomic distance is compared
+against tabulated single/double/triple bond lengths for that element pair, with
+tolerances of $(10,5,3)$\,pm; the resulting bond orders are summed per atom to
+give an inferred valence.
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Metric} & \textbf{Definition} & \textbf{Shape reduction} \\
+\midrule
+atom stability     & inferred valence $=$ expected valence & $(n,3)\to n$ booleans $\to$ scalar \\
+molecule stability & \emph{all} atoms in the molecule stable & $n$ booleans $\to$ 1 boolean \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Expected valences are H:1, C:4, N:3, O:2, F:1. Molecule stability is the harsher
+metric by construction --- one wrong atom in $18$ fails the whole molecule --- so it
+lags atom stability substantially in an undertrained model.
+
+\paragraph{Validating the metric itself.} Run on \emph{real} QM9 geometries the
+implementation gives $0.994$ atom / $0.951$ molecule stability, against the
+published $0.99$/$0.95$. Reproducing the reference numbers on reference data is
+what establishes that the tolerances and bond tables are right, so that a poor
+score on generated molecules can be attributed to the model.
+
+\paragraph{The heavy-atom caveat.} With \code{--remove-h}, exact valence is
+unsatisfiable: a carbon that came from methane has no heavy-atom neighbours at
+all. In that mode the check is relaxed to \emph{valence $\le$ allowed}, treating
+the deficit as implicit hydrogens. On real data this reads $0.996$/$0.978$. It
+is a much weaker test, and no-H numbers must not be compared with with-H ones.
+
+\section{Masking: the invariant to preserve}
+\label{sec:masking}
+
+Because the implementation is dense, correctness rests on padded slots never
+influencing anything. The places that enforce it:
+
+\begin{center}\small
+\begin{tabular}{@{}llp{5.6cm}@{}}
+\toprule
+\textbf{Location} & \textbf{Mechanism} & \textbf{What breaks without it} \\
+\midrule
+dataset \code{\_\_getitem\_\_} & \code{* mask[:, None]} & padded rows decode as spurious hydrogens \\
+\code{remove\_mean}    & masked mean, divide by $n_b$ & centre of mass computed over $N$, not $n_b$ \\
+\code{edge\_mask}      & outer product of masks, minus $I$ & phantom atoms send messages \\
+\code{n\_edges}        & \code{edge\_mask.sum(2)}   & aggregation normalised by $N-1$ \\
+every layer output     & \code{* node\_mask}        & padding accumulates state across layers \\
+loss                   & \code{eps} masked at creation & padded slots contribute error \\
+\code{dof}             & \code{node\_mask.sum()}    & per-dimension mean depends on padding \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\code{test\_masking\_and\_com} asserts the output invariant directly: for a batch
+containing molecules of sizes $9,7,5,3$ padded to $N=9$, both output tensors are
+$0$ in every padded slot, and the masked centre of mass is zero to
+$1.5\times10^{-11}$.
+
+\section{Computational cost}
+\label{sec:cost}
+
+\subsection{Where the memory goes}
+
+The dense formulation materialises $B\!\times\!N^2$ edges, each carrying $H$
+channels. For $B=64$, $N=29$, $H=192$ in \code{float32}:
+\begin{center}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Tensor} & \textbf{Elements} & \textbf{Memory} \\
+\midrule
+\code{edge\_mlp} input \shape{B,N,N,2H{+}1} & $20.7$\,M & $82.9$\,MB \\
+message \code{m} \shape{B,N,N,H}            & $10.3$\,M & $41.3$\,MB \\
+node tensor \shape{B,N,H}                   & $0.36$\,M & $1.4$\,MB \\
+\bottomrule
+\end{tabular}
+\end{center}
+Several such activations are retained per layer for the backward pass, so
+training memory scales as $\mathcal{O}(L\cdot B\cdot N^2\cdot H)$ --- the edge
+tensor, not the parameters ($1.6$\,M, about $6$\,MB), is what fills the device.
+Reduce \code{--batch-size} or \code{--hidden} first when memory is tight.
+
+For QM9 the dense choice costs almost nothing: a fully connected $29$-atom
+molecule has $812$ directed edges, and a sparse implementation of the same model
+would build essentially the same number. Dense wins on simplicity here; it would
+not for larger molecules.
+
+\subsection{Measured throughput}
+
+On Apple Silicon (MPS), batch size $64$, one epoch $=100$k molecules:
+
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Configuration} & \textbf{Params} & \textbf{ms/iter} & \textbf{min/epoch} \\
+\midrule
+$H{=}256$, $L{=}9$ (EDM paper) & $4.22$\,M & $613$ & $16.0$ \\
+$H{=}192$, $L{=}6$ (default)   & $1.60$\,M & $294$ & $7.7$ \\
+$H{=}128$, $L{=}4$             & $0.48$\,M & $123$ & $3.2$ \\
+$H{=}128$, $L{=}4$, \code{--remove-h} & $0.48$\,M & $21$ & $0.5$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+The last two rows are the same model on the same number of molecules; only $N$
+changed, from $29$ to $9$. The measured speedup is $123/21 \approx 5.9\times$,
+against the $\left(29/9\right)^2 \approx 10.4\times$ that pure $N^2$ scaling of
+the edge axis would predict --- the shortfall is per-iteration overhead
+(kernel launches, the optimiser step, host-device synchronisation) that does not
+shrink with $N$. It is nevertheless the reason the heavy-atom mode is the
+practical setting for a laptop.
+
+\section{Summary: one forward pass end to end}
+
+Collecting every shape change for a single training step with the default
+configuration $B{=}64$, $N{=}29$, $K{=}5$, $H{=}192$, $L{=}6$:
+
+\begin{center}
+\begin{tabular}{@{}rlll@{}}
+\toprule
+\textbf{\#} & \textbf{Operation} & \textbf{Shape} & \textbf{Where} \\
+\midrule
+1  & batch from \code{DataLoader}      & \shape{64,29,3}, \shape{64,29,5}, \shape{64,29} & \code{data.py} \\
+2  & scale types by $0.25$             & unchanged & \code{normalize} \\
+3  & project coordinates into $\mathcal{X}_0$ & unchanged & \code{remove\_mean} \\
+4  & draw one timestep per molecule    & \shape{64} & \code{loss} \\
+5  & gather $\alpha_t,\sigma_t$        & \shape{64} $\to$ \shape{64,1,1} & \code{loss} \\
+6  & add noise                         & \shape{64,29,3}, \shape{64,29,5} & \code{loss} \\
+\addlinespace
+7  & embed types $+$ time              & \shape{64,29,6} $\to$ \shape{64,29,192} & \code{embed} \\
+8  & build the edge mask               & \shape{64,29,1} $\to$ \shape{64,29,29,1} & \code{forward} \\
+9  & $\times L{=}6$: lift to edges     & \shape{64,29,29,385} & \code{edge\_mlp} \\
+10 & \phantom{$\times L$:} message     & \shape{64,29,29,192} & \code{edge\_mlp} \\
+11 & \phantom{$\times L$:} coordinate scalar & \shape{64,29,29,1} & \code{coord\_mlp} \\
+12 & \phantom{$\times L$:} contract to nodes & \shape{64,29,192}, \shape{64,29,3} & sum over axis 2 \\
+\addlinespace
+13 & coordinate displacement, re-projected & \shape{64,29,3} & \code{forward} \\
+14 & decode type noise                 & \shape{64,29,192} $\to$ \shape{64,29,5} & \code{decode} \\
+15 & squared error / d.o.f.            & $\to$ scalar & \code{loss} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+At sampling time steps 7--14 are repeated $T=1000$ times with the shapes
+unchanged, followed by an \code{argmax} that collapses \shape{B,N,K} to
+\shape{B,N} and a final one-hot re-expansion.
+
+\section*{References}
+\begin{enumerate}[leftmargin=1.6em]
+\item E.~Hoogeboom, V.~G.~Satorras, C.~Vignac, M.~Welling.
+      \emph{Equivariant Diffusion for Molecule Generation in 3D}. ICML 2022.
+      \url{https://arxiv.org/abs/2203.17003}
+\item V.~G.~Satorras, E.~Hoogeboom, M.~Welling.
+      \emph{E(n) Equivariant Graph Neural Networks}. ICML 2021.
+      \url{https://arxiv.org/abs/2102.09844}
+\item J.~Ho, A.~Jain, P.~Abbeel.
+      \emph{Denoising Diffusion Probabilistic Models}. NeurIPS 2020.
+      \url{https://arxiv.org/abs/2006.11239}
+\item R.~Ramakrishnan, P.~O.~Dral, M.~Rupp, O.~A.~von Lilienfeld.
+      \emph{Quantum chemistry structures and properties of 134 kilo molecules}.
+      Scientific Data 1, 140022 (2014).
+\end{enumerate}
+
+\end{document}
